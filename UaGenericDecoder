@@ -1,0 +1,225 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to you under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+__author__      = "Losson Paul"
+__copyright__   = "Copyright 2024, France"
+
+import struct
+import json
+from bs4 import BeautifulSoup
+
+# Mapping of type names to struct format characters
+TYPE_FORMAT_MAP = {
+    "Float": 'f',
+    "Int32": 'i',
+    "String": 's',
+    "Boolean": "?",
+    "DateTime": "q",
+    "short": "h"
+}
+
+class StructuredTypeParser:
+    def __init__(self, dict_value):
+        """
+        Initialize the parser with the XML dictionary.
+        """
+        self.structured_types = {}
+        self.enumeration_types = {}
+        self._parse_types_dictionary(dict_value)
+
+    def _parse_types_dictionary(self, dict_value):
+        """
+        Parse the structured types from the XML content.
+        """
+        shared_dict_value = BeautifulSoup(dict_value, 'xml')
+        structured_type_list = shared_dict_value.find_all('opc:StructuredType')
+        enumeration_type_list = shared_dict_value.find_all('opc:EnumeratedType')
+        structured_types = []
+        enumeration_types = []
+
+        for structured_type in structured_type_list:
+            structured_type_name = structured_type.get('Name')
+            field_list = []
+
+            for field in structured_type.find_all('opc:Field'):
+                field_is_array = bool(field.get('LengthField'))
+                field_name = field.get('Name')
+                field_type = field.get('TypeName').split(':')[-1]
+                field_list.append({
+                    "Name": field_name,
+                    "Type": field_type,
+                    "IsArray": field_is_array
+                })
+
+            structured_types.append({
+                "StructuredTypeName": structured_type_name,
+                "Fields": field_list
+            })
+
+        for enumeration_type in enumeration_type_list:
+            enumeration_type_name = enumeration_type.get('Name')
+            field_list = []
+
+            for field in enumeration_type.find_all('opc:EnumeratedValue'):
+                field_name = field.get('Name')
+                value = field.get('Value').split(':')[-1]
+                field_list.append({
+                    "Name": field_name,
+                    "Value" : value
+                })
+
+            enumeration_types.append({
+                "EnumerationTypeName": enumeration_type_name,
+                "Fields": field_list
+            })
+
+        self.structured_types = structured_types
+        self.enumeration_types = enumeration_types
+
+        with open('unpacked_structured_types.json', 'w') as f:
+            print(json.dump(self.structured_types, f, indent=4))
+        with open('unpacked_enumeration_types.json', 'w') as f:
+            print(json.dump(self.enumeration_types, f, indent=4))
+
+        return structured_types
+
+    def get_structured_types(self):
+        """
+        Return the structured types.
+        """
+        return self.structured_types
+
+    def get_enumeration_types(self):
+        """
+        Return the structured types.
+        """
+        return self.enumeration_types
+
+    def find_structured_type(self, structure_name):
+        """
+        Find and return a structured type by name.
+        """
+        for structured_type in self.structured_types:
+            if structured_type["StructuredTypeName"] == structure_name:
+                return structured_type
+        return None
+
+
+class StructuredTypeUnpacker:
+    def __init__(self, structured_types, enumeration_types):
+        """
+        Initialize the unpacker with the structured types.
+        """
+        self.structured_types = structured_types
+        self.enumeration_type = enumeration_types
+
+    def _unpack_field(self, field_type, byte_buffer, offset, is_array):
+        """
+        Unpack a field from the byte buffer.
+        """
+        values = []
+        value = ""
+
+        if is_array:
+            array_length = struct.unpack_from('i', byte_buffer, offset)[0]
+            offset += 4
+
+            for _ in range(array_length):
+                value, offset = self._unpack_field(field_type, byte_buffer, offset, False)
+                values.append(value)
+        else:
+            if field_type in TYPE_FORMAT_MAP:
+                format_char = TYPE_FORMAT_MAP[field_type]
+
+                if field_type == "String":
+                    str_len = struct.unpack_from('i', byte_buffer, offset)[0]
+                    offset += 4
+                    value = struct.unpack_from(f'{str_len}s', byte_buffer, offset)[0].decode('utf-8')
+                    offset += str_len
+                else:
+                    print(byte_buffer, offset)
+                    value = struct.unpack_from(format_char, byte_buffer, offset)[0]
+                    offset += struct.calcsize(format_char)
+
+                values = value
+            else:
+                custom_type = self._find_structured_type(field_type)
+                if custom_type:
+                    value, offset = self._unpack_structured_type(custom_type, byte_buffer, offset)
+                    values = value
+                else:
+                    enum_type = self._find_enumeration_type(field_type)
+                    if enum_type:
+                        value, offset = self._unpack_enumeration_type(enum_type, byte_buffer, offset)
+                        values = value
+                    else:
+                        raise ValueError(f"Unknown field type: {field_type}")
+        print(values)
+        return values, offset
+
+    def _unpack_structured_type(self, structured_type, byte_buffer, offset):
+        """
+        Unpack a structured type from the byte buffer.
+        """
+        unpacked_data = {"StructuredTypeName": structured_type["StructuredTypeName"], "Fields": []}
+
+        for field in structured_type["Fields"]:
+            field_name = field["Name"]
+            field_type = field["Type"]
+            is_array = field["IsArray"]
+            value, offset = self._unpack_field(field_type, byte_buffer, offset, is_array)
+            unpacked_data["Fields"].append({"Name": field_name, "Value": value})
+
+        return unpacked_data, offset
+
+    def _unpack_enumeration_type(self, enum_type, byte_buffer, offset):
+        """
+        Unpack an enumeration type from the byte buffer.
+        """
+        unpacked_data = {"EnumerationTypeName": enum_type["EnumerationTypeName"], "Fields": []}
+        value, offset = self._unpack_field("Int32", byte_buffer, offset, False)
+        for field in enum_type["Fields"]:
+            field_value = field["Value"]
+            if value == field_value:
+                field_name = field["Name"]
+                unpacked_data["Fields"].append({"Name": field_name, "Value": value})
+                break
+
+
+        return unpacked_data, offset
+
+    def _find_structured_type(self, structure_name):
+        """
+        Find and return a structured type by name.
+        """
+        return next((st for st in self.structured_types if st["StructuredTypeName"] == structure_name), None)
+
+    def _find_enumeration_type(self, enum_name):
+        """
+        Find and return a structured type by name.
+        """
+        print(self.enumeration_type)
+        return next((st for st in self.enumeration_type if st["EnumerationTypeName"] == enum_name), None)
+
+    def unpack(self, structure_name, byte_buffer, offset=0):
+        """
+        Unpack a structured type by name from the byte buffer.
+        """
+        structured_type = self._find_structured_type(structure_name)
+
+        if not structured_type:
+            raise ValueError(f"Structured type '{structure_name}' not found.")
+
+        return self._unpack_structured_type(structured_type, byte_buffer, offset)
